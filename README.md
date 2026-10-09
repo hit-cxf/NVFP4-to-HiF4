@@ -1,0 +1,288 @@
+# ⚡ NVFP4-to-HiF4
+
+<a id="chinese"></a>
+
+**简体中文** | [English](#english)
+
+面向华为昇腾系列 NPU 上的 NVFP4 模型推理，提供 **NVFP4 → HiF4 量化适配的核心算法**。
+
+**2026 华为算法大赛决赛高校组第 4 名。** 当前公开版本为 `09281502`，包含 Linear 权重与激活量化，以及 Attention Q/K/V 量化。
+
+## 背景与范围
+
+将 NVFP4 格式模型用于目标硬件时，需要在量化表示之间转换，并控制转换对矩阵乘法和 Attention 输出的影响。本项目利用校准数据的统计信息、等价变换和误差反馈，为 Linear 与 Attention 构造 HiF4 表示。
+
+当前实现是 **CPU eager PyTorch 量化参考代码**，覆盖校准与在线量化两个阶段。完整昇腾推理部署还需要对接模型加载、HiF4 数据打包和目标 NPU 算子。本仓库提供的是其中的量化适配层。
+
+仓库只发布以下两个文件。背景、方法、接口、用法和成绩均在本 README 中说明，任务书、赛事附件、数据集和内部实验工具不随仓库发布。
+
+```text
+NVFP4-to-HiF4/
+├── README.md
+└── solution.py
+```
+
+## 核心方法
+
+- **HiF4 分层量化**：解码 NVFP4 输入后，以每 64 个元素为一组，搜索 E6M2 根尺度、两级离散尺度、符号与四分之一间隔尾数。
+- **Linear**：利用校准激活统计学习两次 Householder 反射，结合 RMS 等价缩放、通道重排和 H64 正交变换；使用激活 Gram 矩阵加权权重量化误差，通过分块误差传播和离散修码改善输出。在线激活复用冻结的变换、权重敏感度与低秩修码信息。
+- **Attention Q/K**：K 按序列去均值，Q/K 采用互逆缩放和共享正交变换；结合 Full/causal 输出敏感度，拟合对角项加 rank-3 的误差度量。Q 的 16 个修码候选位置按校准时的实际残差覆盖选择，Q/K 在线各执行两轮离散修码。
+- **Attention V**：确定根尺度和层级尺度后，对每 64 token 窗口的通道平均量化残差使用 **0.2** 系数反馈，再重新舍入尾数。V 不保存校准状态。
+
+<a id="quick-start"></a>
+
+## 快速入门
+
+依赖 Python 和 PyTorch，代码另使用标准库 `math`。在已安装 Python 的环境中：
+
+```bash
+python -m pip install torch
+```
+
+在仓库根目录运行下面的最小示例。它使用 CPU 上可表示的 NVFP4 数值，覆盖六个接口；用于展示调用方式，不代表真实模型精度或 NPU 性能。
+
+```python
+import torch
+import solution
+
+
+def make_pair(rows, channels):
+    # Unpacked NVFP4 values: -1 or +1; one scale per 16 values.
+    quant = (2 * torch.randint(0, 2, (rows, channels)) - 1).float()
+    scale = torch.ones(rows, channels // 16, dtype=torch.float32)
+    return quant, scale
+
+
+def reconstruct(params, shape):
+    # Reconstruct the transformed HiF4 operand for this example.
+    return (
+        params["scale_factor"].float()
+        * params["scale_lv2"].float()
+        * params["scale_lv3"].float()
+        * params["sign"].float()
+        * params["mant"].float()
+    ).reshape(shape)
+
+
+torch.set_num_threads(1)
+torch.manual_seed(0)
+
+# Linear: calibrate weights once, then quantize activations with frozen state.
+weight = make_pair(4, 64)
+activation = make_pair(8, 64)
+linear = solution.hif4_calibration_and_quantize_weight(*weight, [activation])
+activation_params = solution.hif4_dynamic_quantize_activation(
+    *activation, linear["activation_state"]
+)
+w_hat = reconstruct(linear["weight_params"], (4, 64))
+a_hat = reconstruct(activation_params, (8, 64))
+print("Linear output shape:", tuple((a_hat @ w_hat.T).shape))
+
+# Attention: one Q head, one KV head, head dimension 64.
+q, k, v = (make_pair(8, 64) for _ in range(3))
+states = solution.hif4_calibration_attention(
+    [{"q": q, "k": k, "v": v}], 1, 1, 64
+)
+q_params = solution.hif4_dynamic_quantize_q(*q, 1, 64, states["q_state"])
+k_params = solution.hif4_dynamic_quantize_k(*k, 1, 64, states["k_state"])
+v_params = solution.hif4_dynamic_quantize_v(*v, 1, 64, states["v_state"])
+print("Q/K/V mantissa shapes:", [
+    tuple(params["mant"].shape) for params in (q_params, k_params, v_params)
+])
+```
+
+预期输出：
+
+```text
+Linear output shape: (8, 4)
+Q/K/V mantissa shapes: [(8, 1, 8, 2, 4), (8, 1, 8, 2, 4), (8, 1, 8, 2, 4)]
+```
+
+实际使用时，先用代表性校准数据生成状态，再将对应状态原样传给在线接口。示例中的 Linear 权重和激活是**配套变换后的操作数**，应一起用于近似 `A @ W.T`；单独重建的权重并非原权重坐标下的逐元素近似。Q/K 同样需要配套使用。
+
+## 输入与输出格式
+
+`quant` 表示**已经解包为数值的 NVFP4 张量**，不是打包后的 4-bit 字节流；`scale` 为每 16 个数共享的尺度。输入张量放在 CPU 上。对最后一维为 `C` 的输入：
+
+```text
+scale.shape = quant.shape[:-1] + (C // 16,)
+```
+
+代码将数值与尺度相乘后转为 BF16，再进行后续处理。最小示例使用 FP32 输入张量。
+
+| 场景 | 输入结构 |
+|---|---|
+| Linear 权重 | `[M, C]`，`C` 为正的 64 倍数 |
+| Linear 激活 | `[..., C]`，通道数与权重一致 |
+| Linear 校准列表 | `[(activation_quant, activation_scale), ...]` |
+| Attention Q | `[T, Hq × D]` |
+| Attention K/V | `[T, Hkv × D]` |
+| Attention 校准列表 | `[{"q": (q_quant, q_scale), "k": (k_quant, k_scale), "v": (v_quant, v_scale)}, ...]` |
+
+Attention 中 `T > 0`，`Hq` 为 `Hkv` 的整数倍，同一校准样本的 Q/K/V 序列长度一致；示例采用 `D = 64`。常用路径的 `D` 为 64 的倍数，具体形状检查见源码。校准状态是与相应输入配置绑定的不透明对象，在线调用时保持只读。
+
+对于输入 `[..., C]`，令前缀 `P = [..., C // 64]`，返回的 HiF4 字典包含：
+
+| 字段 | 形状 | dtype | 含义 |
+|---|---|---|---|
+| `scale_factor` | `P + [1, 1, 1]` | BF16 | E6M2 根尺度的数值表示 |
+| `scale_lv2` | `P + [8, 1, 1]` | INT8 | 第二级尺度，1 或 2 |
+| `scale_lv3` | `P + [8, 2, 1]` | INT8 | 第三级尺度，1 或 2 |
+| `sign` | `P + [8, 2, 4]` | INT8 | −1、0 或 1 |
+| `mant` | `P + [8, 2, 4]` | BF16 | 0、0.25、…、1.75 |
+
+这些字段是张量形式的数值表示，不是 NPU 可直接读取的打包二进制。
+
+## 六个接口
+
+完整函数定义见 [solution.py](solution.py)。
+
+| 接口 | 作用与返回值 |
+|---|---|
+| `hif4_calibration_and_quantize_weight` | Linear 校准及权重量化，返回 `weight_params` 与 `activation_state` |
+| `hif4_dynamic_quantize_activation` | 使用冻结状态量化在线激活，返回 HiF4 字典 |
+| `hif4_calibration_attention` | Attention 校准，返回 `q_state`、`k_state`、`v_state` |
+| `hif4_dynamic_quantize_q` | 在线 Q 量化，返回 HiF4 字典 |
+| `hif4_dynamic_quantize_k` | 在线 K 量化，返回 HiF4 字典 |
+| `hif4_dynamic_quantize_v` | 在线 V 量化，返回 HiF4 字典 |
+
+## 比赛成绩
+
+**2026 华为算法大赛决赛高校组第 4 名。** 以下数据来自任务 `2146334` 的官方评测回执，提交时间为 `2026-09-28 13:07:40`，Linear 与 Attention 均为 **All cases passed**。
+
+| 指标 | 成绩 |
+|---|---:|
+| 算法总分 | **25515.678320058352** |
+| Linear Performance Total | 7070.00 |
+| Linear Quality Total | 4647.10 |
+| Attention Performance Total | 26125.00 |
+| Attention Quality Total | 16548.31 |
+| 整场执行用时 | 753079 ms（约 753.08 秒） |
+
+这是赛事回执记录，并非本地重新评测；整场用时不等同于单个算子或完整模型的推理延迟。
+
+## 版本与打包
+
+公开源码对应选定版本 **09281502（FinalsAttentionQVOnly）**，文件 SHA-256 为：
+
+```text
+91e0ff8fe6634e03523f6189162f83f8fcea20497bab044a1f13489012e8f8e7
+```
+
+如需生成单文件提交包，在仓库根目录执行：
+
+```bash
+python -m zipfile -c solution.zip solution.py
+```
+
+整理文档时保持算法源码不变。这里只发布核心实现和说明，生成的 ZIP 无需加入 Git。
+
+---
+
+<a id="english"></a>
+
+## English
+
+[返回中文 / Back to Chinese](#chinese)
+
+**Core NVFP4-to-HiF4 quantization algorithms for enabling NVFP4 model inference on Huawei Ascend NPUs.**
+
+**4th place in the university division of the 2026 Huawei Algorithm Competition finals.** The selected release, `09281502`, includes Linear weight/activation quantization and Attention Q/K/V quantization.
+
+### Background and scope
+
+Using an NVFP4 model on a target platform requires adapting its quantized representation while controlling the error introduced into matrix multiplication and Attention outputs. This project uses calibration statistics, equivalent transformations, and error feedback to construct HiF4 representations for these operations.
+
+The code is a **CPU eager PyTorch reference implementation** of the calibration and online quantization stages. Deploying a complete model on Ascend also requires model loading, HiF4 packing, and integration with NPU kernels. This repository provides the quantization adaptation layer.
+
+Only `solution.py` and this bilingual `README.md` are published. Competition task documents, attachments, datasets, and internal experiment tools are excluded.
+
+### Methods
+
+- **Hierarchical HiF4 quantization:** decode NVFP4 inputs and process groups of 64 values, searching an E6M2 root scale, two discrete scale levels, signs, and mantissas in increments of one quarter.
+- **Linear:** learn two Householder reflections from calibration activations, combined with RMS-based equivalent scaling, channel reordering, and an H64 orthogonal transform. Activation Gram matrices weight the quantization error; blockwise error propagation and discrete code refinement improve the output approximation. Online activation quantization reuses frozen transforms, weight sensitivity, and low-rank refinement information.
+- **Attention Q/K:** center K across the sequence and apply reciprocal Q/K scaling and a shared orthogonal transform. Full and causal output sensitivity guide a diagonal-plus-rank-3 error metric. Q selects 16 candidate refinement positions using observed calibration residual coverage; Q and K each perform two online refinement steps.
+- **Attention V:** after selecting root and hierarchical scales, feed back the mean per-channel quantization residual within each 64-token window with a coefficient of **0.2**, then round the mantissas again. V stores no calibration state.
+
+### Getting started
+
+Install Python and PyTorch (`python -m pip install torch`), then run the [minimal example above](#quick-start) from the repository root. Its English-commented code exercises all six interfaces using tiny CPU tensors and prints the expected output shapes. It demonstrates API usage rather than model accuracy or NPU performance.
+
+For real workloads, calibrate using representative data, then pass the resulting frozen states unchanged to the matching online interfaces. Reconstructed Linear weights and activations are **paired transformed operands** for approximating `A @ W.T`; an individual reconstructed weight is not an elementwise approximation in the original weight coordinates. Q and K must likewise be used as a pair.
+
+### Data formats
+
+`quant` is a tensor of **unpacked NVFP4 numerical values**, not a packed 4-bit byte stream. Each scale applies to 16 values. Use CPU tensors; for an input with final dimension `C`:
+
+```text
+scale.shape = quant.shape[:-1] + (C // 16,)
+```
+
+The implementation multiplies values by scales and converts the decoded result to BF16 before further processing. The example uses FP32 inputs.
+
+| Input | Layout |
+|---|---|
+| Linear weights | `[M, C]`, where `C` is a positive multiple of 64 |
+| Linear activations | `[..., C]`, matching the weight channel count |
+| Linear calibration data | `[(activation_quant, activation_scale), ...]` |
+| Attention Q | `[T, Hq × D]` |
+| Attention K/V | `[T, Hkv × D]` |
+| Attention calibration data | `[{"q": (q_quant, q_scale), "k": (k_quant, k_scale), "v": (v_quant, v_scale)}, ...]` |
+
+For Attention, `T > 0`, `Hq` must be a multiple of `Hkv`, and Q/K/V in a calibration sample share the same sequence length. The example uses `D = 64`; the common path uses head dimensions divisible by 64. See the source for shape checks. Treat each calibration state as an opaque, read-only object tied to its input configuration.
+
+For input shape `[..., C]`, define `P = [..., C // 64]`. A HiF4 result is a dictionary with these fields:
+
+| Field | Shape | dtype | Meaning |
+|---|---|---|---|
+| `scale_factor` | `P + [1, 1, 1]` | BF16 | Numerical value of the E6M2 root scale |
+| `scale_lv2` | `P + [8, 1, 1]` | INT8 | Second-level scale: 1 or 2 |
+| `scale_lv3` | `P + [8, 2, 1]` | INT8 | Third-level scale: 1 or 2 |
+| `sign` | `P + [8, 2, 4]` | INT8 | −1, 0, or 1 |
+| `mant` | `P + [8, 2, 4]` | BF16 | 0, 0.25, …, 1.75 |
+
+These are numerical tensor representations, not packed NPU storage buffers.
+
+### API
+
+See [solution.py](solution.py) for the complete function signatures.
+
+| Function | Purpose and return value |
+|---|---|
+| `hif4_calibration_and_quantize_weight` | Calibrate Linear and quantize weights; returns `weight_params` and `activation_state` |
+| `hif4_dynamic_quantize_activation` | Quantize online activations using frozen state; returns a HiF4 dictionary |
+| `hif4_calibration_attention` | Calibrate Attention; returns `q_state`, `k_state`, and `v_state` |
+| `hif4_dynamic_quantize_q` | Quantize Q; returns a HiF4 dictionary |
+| `hif4_dynamic_quantize_k` | Quantize K; returns a HiF4 dictionary |
+| `hif4_dynamic_quantize_v` | Quantize V; returns a HiF4 dictionary |
+
+### Competition results
+
+**4th place in the university division of the 2026 Huawei Algorithm Competition finals.** The following results come from the official receipt for task `2146334`, submitted at `2026-09-28 13:07:40`. Both Linear and Attention reported **All cases passed**.
+
+| Metric | Result |
+|---|---:|
+| Overall algorithm score | **25515.678320058352** |
+| Linear Performance Total | 7070.00 |
+| Linear Quality Total | 4647.10 |
+| Attention Performance Total | 26125.00 |
+| Attention Quality Total | 16548.31 |
+| Full evaluation runtime | 753079 ms (approximately 753.08 s) |
+
+These are recorded competition results, not a new local benchmark. The full evaluation runtime is not a measure of individual operator or end-to-end model inference latency.
+
+### Version and packaging
+
+The source matches the selected **09281502 (FinalsAttentionQVOnly)** release. Its SHA-256 is:
+
+```text
+91e0ff8fe6634e03523f6189162f83f8fcea20497bab044a1f13489012e8f8e7
+```
+
+To create a single-file submission archive from the repository root:
+
+```bash
+python -m zipfile -c solution.zip solution.py
+```
+
+The algorithm is unchanged by this documentation update. Only the core implementation and documentation belong in the repository; the generated ZIP does not need to be committed.
